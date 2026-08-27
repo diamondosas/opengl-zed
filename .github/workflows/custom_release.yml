@@ -3,69 +3,132 @@ name: Build OpenGL Linux Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing Git tag to build and replace, for example v0.1.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+concurrency:
+  group: linux-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   build-linux:
     name: Build Linux Release
     runs-on: ubuntu-22.04
+
     env:
       ZED_WGPU_BACKEND: gl
-      RUST_BACKTRACE: '1'
+      RUST_BACKTRACE: "1"
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+
     steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[^[:space:]]+$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG"
+            echo "The tag must start with 'v', for example v0.1.0"
+            exit 1
+          fi
+
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install build dependencies
+        shell: bash
         run: |
+          set -euo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y \
             build-essential \
             clang \
+            pkg-config \
+            libssl-dev \
+            libfontconfig1-dev \
             libx11-dev \
-            libxxcb-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
+            libxcb-randr0-dev \
+            libxcb-render-util0-dev \
+            libxcb-keysyms1-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
             libwayland-dev \
-            libfontconfig1-dev \
-            libssl-dev \
-            pkg-config \
             libgl1-mesa-dev \
-            libegl1-mesa-dev
+            libegl1-mesa-dev \
+            libasound2-dev \
+            libpulse-dev \
+            libdbus-1-dev \
+            libudev-dev \
+            libinput-dev
 
-      - name: Cache cargo registry and target
+      - name: Cache Cargo dependencies and build output
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-rust-
 
       - name: Build Zed in release mode
         run: cargo build --release -p zed
 
       - name: Package release artifact
+        shell: bash
         run: |
-          mkdir -p dist
-          cp target/release/zed dist/zed
-          cd dist
-          tar -czvf zed-linux-x86_64.tar.gz zed
+          set -euo pipefail
 
-      - name: Create GitHub Release & Upload Asset
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/zed-linux-x86_64.tar.gz
+          test -x target/release/zed
+
+          rm -rf dist
+          mkdir -p dist
+
+          cp target/release/zed dist/zed
+          chmod +x dist/zed
+
+          tar -C dist -czf "dist/zed-linux-x86_64-${RELEASE_TAG}.tar.gz" zed
+
+          # Keep only the archive as the GitHub Release asset.
+          rm dist/zed
+
+      - name: Replace entire GitHub Release
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          ASSET="dist/zed-linux-x86_64-${RELEASE_TAG}.tar.gz"
+
+          # Delete the existing release and all of its assets.
+          # The Git tag is preserved because --cleanup-tag is not used.
+          gh release delete "$RELEASE_TAG" --yes || true
+
+          # Create a fresh release using the existing tag.
+          gh release create "$RELEASE_TAG" \
+            "$ASSET" \
+            --title "Zed OpenGL Linux ${RELEASE_TAG}" \
+            --generate-notes
