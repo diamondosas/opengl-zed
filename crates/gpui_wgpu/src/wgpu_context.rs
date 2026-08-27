@@ -288,8 +288,24 @@ impl WgpuContext {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
+        let backend_env = std::env::var("ZED_WGPU_BACKEND")
+            .or_else(|_| std::env::var("WGPU_BACKEND"))
+            .ok()
+            .or_else(|| option_env!("ZED_WGPU_BACKEND").map(String::from));
+
+        let backends = match backend_env {
+            Some(val) => match val.to_lowercase().as_str() {
+                "gl" | "opengl" | "gles" => wgpu::Backends::GL | wgpu::Backends::VULKAN,
+                "vulkan" | "vk" => wgpu::Backends::VULKAN,
+                "metal" => wgpu::Backends::METAL,
+                "dx12" | "directx" => wgpu::Backends::DX12,
+                _ => wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            },
+            None => wgpu::Backends::VULKAN | wgpu::Backends::GL,
+        };
+
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -341,15 +357,43 @@ impl WgpuContext {
             log::info!("ZED_DEVICE_ID filter: {:#06x}", device_id);
         }
 
+        let backend_env = std::env::var("ZED_WGPU_BACKEND")
+            .or_else(|_| std::env::var("WGPU_BACKEND"))
+            .ok()
+            .or_else(|| option_env!("ZED_WGPU_BACKEND").map(String::from));
+
+        let requested_backend = match backend_env {
+            Some(val) => match val.to_lowercase().as_str() {
+                "gl" | "opengl" | "gles" => Some(wgpu::Backend::Gl),
+                "vulkan" | "vk" => Some(wgpu::Backend::Vulkan),
+                "metal" => Some(wgpu::Backend::Metal),
+                "dx12" | "directx" => Some(wgpu::Backend::Dx12),
+                _ => None,
+            },
+            None => None,
+        };
+
         // Sort adapters into a single priority order. Tiers (from highest to lowest):
         //
-        // 1. ZED_DEVICE_ID match — explicit user override
-        // 2. Compositor GPU match — the GPU the display server is rendering on
-        // 3. Device type (Discrete > Integrated > Other > Virtual > Cpu).
+        // 1. ZED_WGPU_BACKEND / WGPU_BACKEND match — explicit backend request (e.g., OpenGL)
+        // 2. ZED_DEVICE_ID match — explicit user device override
+        // 3. Compositor GPU match — the GPU the display server is rendering on
+        // 4. Device type (Discrete > Integrated > Other > Virtual > Cpu).
         //    "Other" ranks above "Virtual" because OpenGL seems to count as "Other".
-        // 4. Backend — prefer Vulkan/Metal/Dx12 over GL/etc.
+        // 5. Backend — prefer Vulkan/Metal/Dx12 over GL/etc if no explicit backend requested.
         adapters.sort_by_key(|adapter| {
             let info = adapter.get_info();
+
+            let backend_requested_match: u8 = match requested_backend {
+                Some(req) => {
+                    if info.backend == req {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                None => 0,
+            };
 
             // Backends like OpenGL report device=0 for all adapters, so
             // device-based matching is only meaningful when non-zero.
@@ -389,6 +433,7 @@ impl WgpuContext {
             };
 
             (
+                backend_requested_match,
                 user_override,
                 compositor_match,
                 type_priority,
