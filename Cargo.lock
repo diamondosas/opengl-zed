@@ -5987,7 +5987,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gpui",
- "log",
  "net",
  "serde",
  "serde_json",
@@ -12404,7 +12403,6 @@ dependencies = [
  "serde_json",
  "settings",
  "theme",
- "theme_settings",
  "ui",
  "util",
  "workspace",
