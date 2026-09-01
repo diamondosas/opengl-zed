@@ -108,9 +108,8 @@ pub use element::{
 };
 pub use git::blame::{BlameRenderer, GitBlame};
 pub use git::{
-    DiffHunkDelegate, ResolvedDiffHunk, ResolvedDiffHunks, RestoreOnlyDiffHunkDelegate,
-    RestoreOnlyUnstagedDiffHunkDelegate, UncommittedDiffHunkDelegate, render_diff_hunk_controls,
-    set_blame_renderer,
+    DefaultDiffHunkRenderer, DiffHunkRenderer, HiddenDiffHunkRenderer,
+    HiddenUnstagedDiffHunkRenderer, render_diff_hunk_controls, set_blame_renderer,
 };
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
 use git::{DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover};
@@ -1158,7 +1157,8 @@ pub struct Editor {
     registered_buffers: HashMap<BufferId, OpenLspBufferHandle>,
     language_detection_task: Task<()>,
     load_diff_task: Option<Shared<Task<()>>>,
-    diff_hunk_delegate: Option<Arc<dyn DiffHunkDelegate>>,
+    diff_hunk_renderer: Option<Arc<dyn DiffHunkRenderer>>,
+    diff_hunk_action_target: Option<WeakEntity<Editor>>,
     selection_mark_mode: bool,
     toggle_fold_multiple_buffers: Task<()>,
     _scroll_cursor_center_top_bottom_task: Task<()>,
@@ -2507,7 +2507,8 @@ impl Editor {
             serialize_folds: Task::ready(()),
             text_style_refinement: None,
             load_diff_task: None,
-            diff_hunk_delegate: None,
+            diff_hunk_renderer: None,
+            diff_hunk_action_target: None,
             minimap: None,
             change_list: ChangeList::new(),
             mode,
@@ -9193,7 +9194,7 @@ impl Editor {
     ) -> impl 'a + Iterator<Item = (Range<Anchor>, Hsla)> {
         self.highlighted_rows
             .get(&TypeId::of::<T>())
-            .map_or(&[] as &[_], |vec| vec.as_slice())
+            .map_or(&[] as &[_], |highlights| highlights.as_slice())
             .iter()
             .map(|highlight| (highlight.range.clone(), (highlight.color)(cx)))
     }
@@ -9207,21 +9208,75 @@ impl Editor {
         cx: &mut App,
     ) -> BTreeMap<DisplayRow, LineHighlight> {
         let snapshot = self.snapshot(window, cx);
+        let max_row = snapshot.max_point().row();
+        self.highlighted_display_rows_in_range(
+            Anchor::Min..Anchor::Max,
+            DisplayRow(0)..max_row.next_row(),
+            &snapshot.display_snapshot,
+            cx,
+        )
+    }
+
+    pub fn highlighted_display_rows_in_range(
+        &self,
+        anchor_range: Range<Anchor>,
+        display_row_range: Range<DisplayRow>,
+        snapshot: &DisplaySnapshot,
+        cx: &App,
+    ) -> BTreeMap<DisplayRow, LineHighlight> {
+        if display_row_range.is_empty() {
+            return BTreeMap::default();
+        }
+
+        let buffer_snapshot = snapshot.buffer_snapshot();
         let mut used_highlight_orders = HashMap::default();
         self.highlighted_rows
             .values()
-            .flat_map(|highlighted_rows| highlighted_rows.iter())
+            .flat_map(|highlighted_rows| {
+                let start_index = highlighted_rows.partition_point(|highlight| {
+                    highlight
+                        .range
+                        .end
+                        .cmp(&anchor_range.start, buffer_snapshot)
+                        .is_lt()
+                });
+                let end_index = highlighted_rows.partition_point(|highlight| {
+                    highlight
+                        .range
+                        .start
+                        .cmp(&anchor_range.end, buffer_snapshot)
+                        .is_le()
+                });
+                highlighted_rows[start_index..end_index]
+                    .iter()
+                    .filter(|highlight| {
+                        highlight
+                            .range
+                            .end
+                            .cmp(&anchor_range.start, buffer_snapshot)
+                            .is_ge()
+                            && highlight
+                                .range
+                                .start
+                                .cmp(&anchor_range.end, buffer_snapshot)
+                                .is_le()
+                    })
+            })
             .fold(
                 BTreeMap::<DisplayRow, LineHighlight>::new(),
                 |mut unique_rows, highlight| {
-                    let start = highlight.range.start.to_display_point(&snapshot);
-                    let end = highlight.range.end.to_display_point(&snapshot);
-                    let start_row = start.row().0;
-                    let end_row = if !highlight.range.end.is_max() && end.column() == 0 {
+                    let start = highlight.range.start.to_display_point(snapshot);
+                    let end = highlight.range.end.to_display_point(snapshot);
+                    let start_row = start.row().0.max(display_row_range.start.0);
+                    let mut end_row = if !highlight.range.end.is_max() && end.column() == 0 {
                         end.row().0.saturating_sub(1)
                     } else {
                         end.row().0
                     };
+                    end_row = end_row.min(display_row_range.end.0.saturating_sub(1));
+                    if start_row > end_row {
+                        return unique_rows;
+                    }
                     let mut header_rows = snapshot
                         .blocks_in_range(
                             DisplayRow(start_row)..DisplayRow(end_row.saturating_add(1)),
