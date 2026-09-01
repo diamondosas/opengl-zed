@@ -28,6 +28,10 @@ jobs:
       ZED_WGPU_BACKEND: gl
       RUST_BACKTRACE: "1"
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      CC: clang-18
+      CXX: clang++-18
+      CFLAGS: "-Wno-error=unused-command-line-argument-hard-error-in-future"
+      CXXFLAGS: "-Wno-error=unused-command-line-argument-hard-error-in-future"
 
     steps:
       - name: Validate release tag
@@ -59,7 +63,8 @@ jobs:
 
           sudo apt-get install -y \
             build-essential \
-            clang \
+            clang-18 \
+            lld-18 \
             pkg-config \
             libssl-dev \
             libfontconfig1-dev \
@@ -80,7 +85,17 @@ jobs:
             libpulse-dev \
             libdbus-1-dev \
             libudev-dev \
-            libinput-dev
+            libinput-dev \
+            pkg-config \
+            libglib2.0-dev
+
+      - name: Update alternatives for clang
+        shell: bash
+        run: |
+          sudo update-alternatives --install /usr/bin/cc cc /usr/bin/clang-18 100
+          sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++-18 100
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
 
       - name: Cache Cargo dependencies and build output
         uses: actions/cache@v4
@@ -95,6 +110,8 @@ jobs:
 
       - name: Build Zed in release mode
         run: cargo build --release -p zed
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld-18"
 
       - name: Package release artifact
         shell: bash
