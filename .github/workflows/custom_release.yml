@@ -1,151 +1,373 @@
-name: Build OpenGL Linux Release
+name: release
 
+# Triggers on any tag push matching vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-suffix
+# e.g. v1.2.3 or v1.2.3-pre
 on:
   push:
     tags:
       - "v*"
 
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Existing Git tag to build and replace, for example v0.1.0"
-        required: true
-        type: string
-
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # CHANGE ME: the name of your binary / crate, used to name build artifacts
+  # and to locate the compiled binary under target/<triple>/release/
+  APP_NAME: your-app-name
 
 concurrency:
-  group: linux-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash -euxo pipefail {0}
+
 jobs:
-  build-linux:
-    name: Build Linux Release
+  # ---------------------------------------------------------------------
+  # Fail fast on a malformed tag instead of burning an hour of CI first.
+  # ---------------------------------------------------------------------
+  validate_tag:
     runs-on: ubuntu-22.04
-
-    env:
-      ZED_WGPU_BACKEND: gl
-      RUST_BACKTRACE: "1"
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
-      CC: clang-18
-      CXX: clang++-18
-      CFLAGS: "-Wno-error=unused-command-line-argument-hard-error-in-future"
-      CXXFLAGS: "-Wno-error=unused-command-line-argument-hard-error-in-future"
-
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
     steps:
-      - name: Validate release tag
-        shell: bash
+      - id: parse
+        name: Validate tag format and APP_NAME
         run: |
-          set -euo pipefail
-
-          if [[ ! "$RELEASE_TAG" =~ ^v[^[:space:]]+$ ]]; then
-            echo "Invalid release tag: $RELEASE_TAG"
-            echo "The tag must start with 'v', for example v0.1.0"
+          TAG="${GITHUB_REF_NAME}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Tag '$TAG' doesn't match vMAJOR.MINOR.PATCH[-suffix], e.g. v1.2.3 or v1.2.3-pre"
             exit 1
           fi
+          if [[ "$APP_NAME" == "your-app-name" ]]; then
+            echo "::error::You forgot to set APP_NAME at the top of release.yml to your actual binary/crate name"
+            exit 1
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "Releasing $APP_NAME ${TAG#v}"
 
-      - name: Checkout repository
-        uses: actions/checkout@v6
+  # ---------------------------------------------------------------------
+  # Tests gate the builds so a broken commit never gets bundled/released.
+  # ---------------------------------------------------------------------
+  test_linux:
+    needs: validate_tag
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+          clean: false
+
+      - name: Install Linux build dependencies
+        run: |
+          if [[ -x ./script/linux ]]; then
+            ./script/linux
+          else
+            sudo apt-get update
+            sudo apt-get install -y build-essential pkg-config cmake libssl-dev \
+              libfreetype6-dev libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+              libwayland-dev libx11-dev libxext-dev libxrandr-dev libxi-dev \
+              mesa-common-dev libgl1-mesa-dev libglu1-mesa-dev
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace --no-fail-fast
+
+  test_macos:
+    needs: validate_tag
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace --no-fail-fast
+
+  # ---------------------------------------------------------------------
+  # Build + bundle. Uses your existing ./script/bundle-* if present,
+  # otherwise falls back to a plain cargo build + archive so the
+  # workflow still produces something usable.
+  # ---------------------------------------------------------------------
+  build_linux:
+    needs: test_linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install Linux build dependencies
+        run: |
+          if [[ -x ./script/linux ]]; then
+            ./script/linux
+          else
+            sudo apt-get update
+            sudo apt-get install -y build-essential pkg-config cmake libssl-dev \
+              libfreetype6-dev libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+              libwayland-dev libx11-dev libxext-dev libxrandr-dev libxi-dev \
+              mesa-common-dev libgl1-mesa-dev libglu1-mesa-dev
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.arch }}
+
+      - name: Build and bundle
+        id: build
+        run: |
+          mkdir -p dist
+          ASSET="dist/${APP_NAME}-linux-${{ matrix.arch }}.tar.gz"
+
+          if [[ -x ./script/bundle-linux ]]; then
+            ./script/bundle-linux
+            # Adjust this glob if your bundle script names the output differently.
+            BUILT=$(find target/release -maxdepth 1 -name "*.tar.gz" | head -n1)
+            if [[ -z "$BUILT" ]]; then
+              echo "::error::./script/bundle-linux ran but produced no .tar.gz under target/release"
+              exit 1
+            fi
+            cp "$BUILT" "$ASSET"
+          else
+            cargo build --release --target "${{ matrix.target }}"
+            BIN="target/${{ matrix.target }}/release/${APP_NAME}"
+            if [[ ! -f "$BIN" ]]; then
+              echo "::error::Expected binary not found at $BIN. Check APP_NAME matches your crate's binary name."
+              exit 1
+            fi
+            tar -czf "$ASSET" -C "target/${{ matrix.target }}/release" "${APP_NAME}"
+          fi
+
+          if [[ ! -s "$ASSET" ]]; then
+            echo "::error::Built artifact $ASSET is missing or empty"
+            exit 1
+          fi
+          echo "asset_path=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-linux-${{ matrix.arch }}.tar.gz
+          path: ${{ steps.build.outputs.asset_path }}
+          if-no-files-found: error
+
+  build_macos:
+    needs: test_macos
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            target: x86_64-apple-darwin
+          - arch: aarch64
+            target: aarch64-apple-darwin
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.arch }}
+
+      - name: Build and bundle
+        id: build
+        run: |
+          mkdir -p dist
+          ASSET="dist/${APP_NAME}-macos-${{ matrix.arch }}.zip"
+
+          if [[ -x ./script/bundle-mac ]]; then
+            ./script/bundle-mac "${{ matrix.target }}"
+            # Adjust this glob if your bundle script names the output differently
+            # (e.g. a .dmg instead of .zip).
+            BUILT=$(find "target/${{ matrix.target }}/release" -maxdepth 1 \( -name "*.dmg" -o -name "*.zip" \) | head -n1)
+            if [[ -z "$BUILT" ]]; then
+              echo "::error::./script/bundle-mac ran but produced no .dmg/.zip under target/${{ matrix.target }}/release"
+              exit 1
+            fi
+            cp "$BUILT" "$ASSET"
+          else
+            cargo build --release --target "${{ matrix.target }}"
+            BIN="target/${{ matrix.target }}/release/${APP_NAME}"
+            if [[ ! -f "$BIN" ]]; then
+              echo "::error::Expected binary not found at $BIN. Check APP_NAME matches your crate's binary name."
+              exit 1
+            fi
+            /usr/bin/zip -j "$ASSET" "$BIN"
+          fi
+
+          if [[ ! -s "$ASSET" ]]; then
+            echo "::error::Built artifact $ASSET is missing or empty"
+            exit 1
+          fi
+          echo "asset_path=$ASSET" >> "$GITHUB_OUTPUT"
+
+      # NOTE: this does not codesign or notarize the macOS build.
+      # If you need Gatekeeper to accept it, add signing/notarization
+      # steps here once you have an Apple Developer certificate set up
+      # as secrets (this is what MACOS_CERTIFICATE / APPLE_NOTARIZATION_*
+      # were doing in the upstream Zed workflow).
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-macos-${{ matrix.arch }}.zip
+          path: ${{ steps.build.outputs.asset_path }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Draft the release, attach assets, verify they actually landed on
+  # GitHub, THEN publish. Never publishes a release with missing assets.
+  # ---------------------------------------------------------------------
+  create_release:
+    needs: [validate_tag, build_linux, build_macos]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
           fetch-depth: 0
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install build dependencies
-        shell: bash
+      - name: Define retry helper
         run: |
-          set -euo pipefail
+          cat > /tmp/retry.sh <<'EOF'
+          retry() {
+            local max=3 delay=5 n=0
+            until "$@"; do
+              n=$((n+1))
+              if [[ $n -ge $max ]]; then
+                echo "::error::Command failed after $max attempts: $*"
+                return 1
+              fi
+              echo "Attempt $n/$max failed, retrying in ${delay}s: $*"
+              sleep "$delay"
+            done
+          }
+          EOF
 
-          sudo apt-get update
-
-          sudo apt-get install -y \
-            build-essential \
-            clang-18 \
-            lld-18 \
-            pkg-config \
-            libssl-dev \
-            libfontconfig1-dev \
-            libx11-dev \
-            libx11-xcb-dev \
-            libxcb1-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libxcb-randr0-dev \
-            libxcb-render-util0-dev \
-            libxcb-keysyms1-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libwayland-dev \
-            libgl1-mesa-dev \
-            libegl1-mesa-dev \
-            libasound2-dev \
-            libpulse-dev \
-            libdbus-1-dev \
-            libudev-dev \
-            libinput-dev \
-            pkg-config \
-            libglib2.0-dev
-
-      - name: Update alternatives for clang
-        shell: bash
-        run: |
-          sudo update-alternatives --install /usr/bin/cc cc /usr/bin/clang-18 100
-          sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++-18 100
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
-
-      - name: Cache Cargo dependencies and build output
-        uses: actions/cache@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-rust-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-
+          path: ./artifacts
 
-      - name: Build Zed in release mode
-        run: cargo build --release -p zed
-        env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=lld-18"
+      - name: List downloaded artifacts
+        run: ls -lR ./artifacts
 
-      - name: Package release artifact
-        shell: bash
+      - name: Flatten and verify expected assets are present
         run: |
-          set -euo pipefail
+          mkdir -p release-assets
+          find ./artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.dmg" \) \
+            -exec cp {} release-assets/ \;
 
-          test -x target/release/zed
+          EXPECTED=(
+            "${APP_NAME}-linux-x86_64.tar.gz"
+            "${APP_NAME}-linux-aarch64.tar.gz"
+            "${APP_NAME}-macos-x86_64.zip"
+            "${APP_NAME}-macos-aarch64.zip"
+          )
+          MISSING=()
+          for f in "${EXPECTED[@]}"; do
+            [[ -f "release-assets/$f" ]] || MISSING+=("$f")
+          done
+          if (( ${#MISSING[@]} > 0 )); then
+            echo "::error::Missing expected release assets: ${MISSING[*]}"
+            echo "Contents of release-assets/:"
+            ls -la release-assets/ || true
+            exit 1
+          fi
+          echo "All expected local assets present:"
+          ls -la release-assets/
 
-          rm -rf dist
-          mkdir -p dist
-
-          cp target/release/zed dist/zed
-          chmod +x dist/zed
-
-          tar -C dist -czf "dist/zed-linux-x86_64-${RELEASE_TAG}.tar.gz" zed
-
-          # Keep only the archive as the GitHub Release asset.
-          rm dist/zed
-
-      - name: Replace entire GitHub Release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Create draft release with assets
         run: |
-          set -euo pipefail
+          source /tmp/retry.sh
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — uploading assets (overwriting any duplicates)."
+            retry gh release upload "$TAG" release-assets/* --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            retry gh release create "$TAG" release-assets/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "$TAG" \
+              --generate-notes \
+              --draft
+          fi
 
-          ASSET="dist/zed-linux-x86_64-${RELEASE_TAG}.tar.gz"
+      - name: Verify assets landed on the remote release
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          COUNT=$(gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" --json assets -q '.assets | length')
+          if [[ "$COUNT" -lt 4 ]]; then
+            echo "::error::Release $TAG only has $COUNT assets attached, expected at least 4"
+            exit 1
+          fi
+          echo "Confirmed $COUNT assets attached to $TAG"
 
-          # Delete the existing release and all of its assets.
-          # The Git tag is preserved because --cleanup-tag is not used.
-          gh release delete "$RELEASE_TAG" --yes || true
+      - name: Publish release (undraft)
+        run: |
+          source /tmp/retry.sh
+          TAG="${GITHUB_REF_NAME}"
+          retry gh release edit "$TAG" --repo "${GITHUB_REPOSITORY}" --draft=false
+          echo "Published $TAG: $(gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" --json url -q '.url')"
 
-          # Create a fresh release using the existing tag.
-          gh release create "$RELEASE_TAG" \
-            "$ASSET" \
-            --title "Zed OpenGL Linux ${RELEASE_TAG}" \
-            --generate-notes
+  # ---------------------------------------------------------------------
+  # If anything upstream failed, leave a loud, single, easy-to-find
+  # error in the Actions UI instead of a pile of red X's to sift through.
+  # ---------------------------------------------------------------------
+  on_failure:
+    needs: [validate_tag, test_linux, test_macos, build_linux, build_macos, create_release]
+    if: failure()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Summarize failure
+        run: |
+          echo "::error::Release workflow failed for tag ${GITHUB_REF_NAME}."
+          echo "validate_tag:    ${{ needs.validate_tag.result }}"
+          echo "test_linux:      ${{ needs.test_linux.result }}"
+          echo "test_macos:      ${{ needs.test_macos.result }}"
+          echo "build_linux:     ${{ needs.build_linux.result }}"
+          echo "build_macos:     ${{ needs.build_macos.result }}"
+          echo "create_release:  ${{ needs.create_release.result }}"
+          echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      # Optional: wire this up to Slack/Discord if you want a ping.
+      # - name: Notify Slack
+      #   if: always()
+      #   env:
+      #     SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      #   run: |
+      #     curl -sf -X POST -H 'Content-type: application/json' \
+      #       --data "$(jq -n --arg text "❌ Release failed for ${GITHUB_REF_NAME}: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" '{"text": $text}')" \
+      #       "$SLACK_WEBHOOK"
